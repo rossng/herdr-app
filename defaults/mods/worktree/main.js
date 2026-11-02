@@ -94,6 +94,26 @@ async function submodules(top, on) {
   return { mods, unpushed };
 }
 
+// What a new branch starts from: the checkout's HEAD, and how far behind its
+// upstream that is as far as this checkout knows (it isn't fetched here).
+// null when HEAD has no commit.
+async function baseOf(top, on) {
+  const head = await git(top, ["log", "-1", "--format=%h%x09%ct%x09%s", "HEAD"], on);
+  if (!head.ok || !head.out) return null;
+  const [sha, at, ...subject] = head.out.split("\t");
+  const branch = await git(top, ["symbolic-ref", "--quiet", "--short", "HEAD"], on);
+  const upstream = await git(top, ["rev-parse", "--abbrev-ref", "@{upstream}"], on);
+  const behind = upstream.ok ? await git(top, ["rev-list", "--count", "HEAD..@{upstream}"], on) : null;
+  return {
+    sha,
+    at: Number(at) || 0,
+    subject: subject.join("\t"),
+    branch: branch.ok ? branch.out : null,
+    upstream: upstream.ok ? upstream.out : null,
+    behind: behind?.ok ? Number(behind.out) || 0 : 0,
+  };
+}
+
 // The repo a folder belongs to: its main checkout and name, and whether
 // the folder is itself a linked worktree. null outside git.
 async function repoOf(folder, on) {
@@ -146,6 +166,7 @@ export default class Worktree extends View {
           this.unpushed = (await submodules(repo.top, this.on)).unpushed;
         }
         if (repo && this.opening) this.list = await checkouts(repo, this.on);
+        if (repo && props().action === "new") this.base = await baseOf(repo.top, this.on);
         this.repo = repo;
         cx.notify();
         if (props().branch) await this.work(cx);
@@ -318,7 +339,8 @@ export default class Worktree extends View {
             ? !r.linked
               ? "This is the repository's main checkout, not a worktree."
               : `Closes the space and deletes ${tilde(r.top, this.userHome)}. The branch stays.`
-            : `A new space on a checkout in ${tilde(ROOT(this.userHome), this.userHome)}/${r.name}/. A branch that exists is checked out; a new one starts from here.`;
+            : `A new space on a checkout in ${tilde(ROOT(this.userHome), this.userHome)}/${r.name}/. A branch that exists is checked out; a new one starts from ${this.base ? "this checkout's commit:" : "here."}`;
+    const base = this.base;
     const blocked = !r || (remove && !r.linked);
     return v_flex()
       .id("worktree")
@@ -331,6 +353,23 @@ export default class Worktree extends View {
       .text_size(13)
       .child(div().font_semibold().text_color(t.foreground).child(title))
       .child(div().text_color(t.muted).child(detail))
+      .when(!remove && Boolean(r && base), (el) =>
+        el.child(
+          v_flex()
+            .gap(2)
+            .child(
+              h_flex()
+                .gap(6)
+                .min_w(0)
+                .child(div().flex_none().text_color(t.foreground).child(`${base.branch ?? "detached HEAD"} @ ${base.sha}`))
+                .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(base.subject))
+                .when(base.at > 0, (el) => el.child(div().flex_none().text_color(t.dim).child(ago(base.at)))),
+            )
+            .when(base.behind > 0, (el) =>
+              el.child(div().text_color(t.blocked).child(`${base.behind} commit${base.behind === 1 ? "" : "s"} behind ${base.upstream} (as of its last fetch).`)),
+            ),
+        ),
+      )
       .when(remove && this.dirty, (el) => el.child(div().text_color(t.blocked).child("It has uncommitted changes: they will be lost.")))
       .when(remove && this.unpushed.length > 0, (el) => el.child(div().text_color(t.blocked).child(`Submodule ${this.unpushed.join(", ")} has commits that aren't pushed anywhere: they will be lost.`)))
       .when(!remove && !blocked, (el) =>
